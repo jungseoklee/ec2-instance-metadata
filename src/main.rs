@@ -1,14 +1,13 @@
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 use std::{
-    error::Error, sync::{Arc, OnceLock, RwLock}, thread, time::{Duration, Instant},
+    error::Error, sync::{Arc, RwLock}, thread, time::{Duration, Instant},
 };
 
 const ENDPOINT: &str = "http://169.254.169.254";
-const TOKEN_TTL: Duration = Duration::from_hours(6);
-const TOKEN_REFRESH_OFFSET: Duration = Duration::from_hours(2);
-
-static TIMESTAMP_FORMAT: OnceLock<TimestampFormat> = OnceLock::new();
+const TOKEN_TTL: Duration = Duration::from_secs(21600);
+const TOKEN_REFRESH_OFFSET: Duration = Duration::from_secs(10800);
 
 #[derive(Parser)]
 #[command(name = "ec2im", about = "EC2 Instance Metadata CLI")]
@@ -37,6 +36,16 @@ enum Command {
 enum TimestampFormat {
     Iso,
     Unix,
+}
+
+struct GlobalConfig {
+    timestamp_format: TimestampFormat,
+}
+
+impl GlobalConfig {
+    fn new(timestamp_format: TimestampFormat) -> Self {
+        Self { timestamp_format }
+    }
 }
 
 fn get_token() -> Result<String, Box<dyn Error>> {
@@ -72,7 +81,7 @@ fn query(token: &str, path: &str) -> Result<String, Box<dyn Error>> {
     }
 }
 
-fn poll(init_token: String, path: &str, interval_ms: u64) -> Result<(), Box<dyn Error>> {
+fn poll(init_token: String, path: &str, interval_ms: u64, config: &GlobalConfig) -> Result<(), Box<dyn Error>> {
     let interval = Duration::from_millis(interval_ms);
     let token = Arc::new(RwLock::new(init_token));
     let token_obtained_at = Arc::new(RwLock::new(Instant::now()));
@@ -94,46 +103,130 @@ fn poll(init_token: String, path: &str, interval_ms: u64) -> Result<(), Box<dyn 
                     *token_obtained_at_clone.write().unwrap() = Instant::now();
                     break;
                 }
-                thread::sleep(Duration::from_mins(1));
+                thread::sleep(Duration::from_secs(60));
             }
         }
     });
 
     loop {
         let current_token = token.read().unwrap().clone();
-        println!("{}", to_json(&path, query(&current_token, path)));
+        println!("{}", to_json(query(&current_token, path), &config));
         thread::sleep(interval);
     }
 }
 
-fn to_json(path: &str, res: Result<String, Box<dyn Error>>) -> String {
-    let timestamp = match TIMESTAMP_FORMAT.get().unwrap_or(&TimestampFormat::Iso) {
-        TimestampFormat::Iso => Utc::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
-        TimestampFormat::Unix =>  Utc::now().timestamp_millis().to_string()
-    };
-    match res {
-        Ok(v) => format!(
-            r#"{{"timestamp": "{}", "path": "{}", "value": "{}", "status": "success"}}"#,
-            timestamp, path, v),
-        Err(e) => format!(
-            r#"{{"timestamp": "{}", "path": "{}", "value": null, "status": "error", "reason": "{}"}}"#,
-            timestamp, path, e),
+#[derive(Serialize)]
+#[serde(untagged)]
+enum Timestamp {
+    Iso(String),
+    Unix(i64),
+}
+
+#[derive(Serialize)]
+struct Output {
+    timestamp: Timestamp,
+    #[serde(flatten)]
+    result: QueryResult,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+enum QueryResult {
+    Success {
+        value: String,
+    },
+    Error {
+        value: Option<String>,
+        reason: String,
     }
+}
+
+fn to_json(res: Result<String, Box<dyn Error>>, config: &GlobalConfig) -> String {
+    let timestamp = match config.timestamp_format {
+        TimestampFormat::Iso => Timestamp::Iso(
+            Utc::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string()
+        ),
+        TimestampFormat::Unix => Timestamp::Unix(Utc::now().timestamp_millis()),
+    };
+    let query_result = match res {
+        Ok(v) => QueryResult::Success { value: v },
+        Err(e) => QueryResult::Error { value: None, reason: e.to_string() },
+    };
+    let output = Output {
+        timestamp,
+        result: query_result,
+    };
+
+    serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-    TIMESTAMP_FORMAT.set(cli.timestamp_format).unwrap();
-
+    let config = GlobalConfig::new(cli.timestamp_format);
     let token = get_token()?;
+
     match cli.command {
         Command::Get { path } => {
-            println!("{}", to_json(&path, query(&token, &path)))
+            println!("Querying {path}...");
+            println!("{}", to_json(query(&token, &path), &config));
         },
         Command::Poll { path, interval } => {
-            poll(token, &path, interval)?;
+            println!("Polling {path}...");
+            poll(token, &path, interval, &config)?;
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn test_to_json_success_iso_timestamp() {
+        // given
+        let result = Ok("i-0b22a22eec53b9321".to_string());
+        let config = GlobalConfig::new(TimestampFormat::Iso);
+
+        // when
+        let res = to_json(result, &config);
+
+        // then
+        let ser_res: Value = serde_json::from_str(&res).expect("valid json");
+        assert_eq!(ser_res["status"], "success");
+        assert_eq!(ser_res["value"], "i-0b22a22eec53b9321");
+        assert!(ser_res["timestamp"].is_string());
+    }
+
+    #[test]
+    fn test_to_json_success_unix_timestamp() {
+        // given
+        let result = Ok("i-0b22a22eec53b9321".to_string());
+        let config = GlobalConfig::new(TimestampFormat::Unix);
+
+        // when
+        let res = to_json(result, &config);
+
+        // then
+        let ser_res: Value = serde_json::from_str(&res).expect("valid json");
+        assert_eq!(ser_res["status"], "success");
+        assert_eq!(ser_res["value"], "i-0b22a22eec53b9321");
+        assert!(ser_res["timestamp"].is_number());
+    }
+
+    #[test]
+    fn test_to_json_error() {
+        // given
+        let result = Err("connection timeout".into());
+        let config = GlobalConfig::new(TimestampFormat::Unix);
+
+        // when
+        let res = to_json(result, &config);
+
+        // then
+        let ser_res: Value = serde_json::from_str(&res).expect("valid json");
+        assert_eq!(ser_res["value"], Value::Null);
+    }
 }
