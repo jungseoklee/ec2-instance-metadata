@@ -57,6 +57,7 @@ fn get_token() -> Result<String, Box<dyn Error>> {
         .arg(format!("{}/latest/api/token", ENDPOINT))
         .arg("-H")
         .arg(format!("X-aws-ec2-metadata-token-ttl-seconds: {}", TOKEN_TTL.as_secs()))
+        .arg("--fail")
         .output()?;
 
     if output.status.success() {
@@ -71,6 +72,7 @@ fn query(token: &str, path: &str) -> Result<String, Box<dyn Error>> {
     let output = std::process::Command::new("curl")
         .arg("-H")
         .arg(format!("X-aws-ec2-metadata-token: {}", token))
+        .arg("--fail")
         .arg(&url)
         .output()?;
 
@@ -167,11 +169,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     match cli.command {
         Command::Get { path } => {
-            println!("Querying {path}...");
             println!("{}", to_json(query(&token, &path), &config));
         },
         Command::Poll { path, interval } => {
-            println!("Polling {path}...");
             poll(token, &path, interval, &config)?;
         }
     }
